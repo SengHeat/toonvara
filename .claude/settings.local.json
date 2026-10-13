@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source \"$HOME/.cargo/env\")",
+      "Bash(rm -f /tmp/toonvara_demo.mp4)",
+      "Bash(cargo run:*)"
+    ]
+  }
+}

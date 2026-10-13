@@ -4,6 +4,7 @@ members = [
     "apps/desktop",
     "crates/studio-core",
     "crates/studio-json",
+    "crates/studio-render",
 ]
 resolver = "2"
 
