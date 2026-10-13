@@ -21,19 +21,6 @@ def playback_options(item):
     return speed, looping, blend
 
 
-def playback_time(elapsed, source_start, source_end, speed, looping):
-    """Absolute, fractional source time; no integer rounding or accumulated drift.
-
-    Reduce elapsed time before multiplying to avoid overflow at large speeds.
-    Non-looping playback clamps at the source end without shortening its slot.
-    """
-    period = (source_end - source_start) / speed
-    elapsed = max(0.0, elapsed)
-    if looping:
-        return source_start + (elapsed % period) * speed
-    return source_end if elapsed >= period else source_start + elapsed * speed
-
-
 def configure_blend(strip, start, duration):
     """A smoothstep fade in timeline frames, independent of the source clock."""
     if duration == 0:
@@ -78,7 +65,6 @@ def build(path, scene):
     scenes = json.loads(Path(path).read_text())
     instances = []
     records = []
-    intervals = []
     previous_scene_end = 0
     for definition in sorted(scenes, key=lambda item: item['start_frame']):
         scene_start = definition['start_frame']
@@ -87,10 +73,17 @@ def build(path, scene):
             raise ValueError('overlapping scenes or invalid scene interval')
         previous_scene_end = scene_end
         for character in definition['characters']:
+            glb_path = character['asset']
+            print(f"TOONVARA_IMPORT:{character['id']}:{glb_path}")
             before = set(scene.objects)
-            bpy.ops.import_scene.gltf(filepath=character['asset'])
+            bpy.ops.import_scene.gltf(filepath=glb_path)
             objects = list(set(scene.objects) - before)
             rig, bindings = action_bindings(objects)
+            if rig:
+                bone_count = len(rig.data.bones)
+                bone_sample = ', '.join(b.name for b in list(rig.data.bones)[:6])
+                print(f"TOONVARA_ARMATURE:{rig.name}:{bone_count}:{bone_sample}")
+                print(f"TOONVARA_CLIPS:{sorted(bindings)}")
             disable_imported_animation(objects)
             container = bpy.data.objects.new(character['id'], None)
             scene.collection.objects.link(container)
@@ -129,44 +122,61 @@ def build(path, scene):
                 if name not in bindings:
                     raise ValueError(f"{character['id']}: missing clip '{item['clip']}' "
                                      f"(fallback {item.get('fallback_clip')!r}); available: {sorted(bindings)}")
-                action, slot = bindings[name]
-                native_start, native_end = action.frame_range
+                action_obj, slot = bindings[name]
+                native_start, native_end = action_obj.frame_range
                 if native_end <= native_start:
                     raise ValueError(f"clip '{name}' must contain at least two keyed frames")
-                # JSON frame 0 maps to Blender/FFmpeg file frame 1.
+
+                source_len = native_end - native_start
+                duration = end - start  # JSON timeline frames
+
+                # JSON frame 0 maps to Blender frame 1.
+                # Strips placed at their actual timeline position — NLA handles
+                # repeat and scale natively; no handler-driven strip_time.
+                blender_start = scene_start + start + 1
+                blender_end = scene_start + end + 1
+
                 track = data.nla_tracks.new()
                 track.name = f'Toonvara {start}: {name}'
-                strip = track.strips.new(name, scene_start, action)
+                strip = track.strips.new(name, blender_start, action_obj)
                 if slot is not None:
                     strip.action_slot = slot
                 strip.action_frame_start = native_start
                 strip.action_frame_end = native_end
-                # Keep active integer frames strictly inside the strip. Drive
-                # clip-local time explicitly to avoid NLA's inclusive endpoints.
-                strip.frame_end = scene_end + 1
-                strip.use_animated_time = True
                 strip.blend_type = 'REPLACE'
-                strip.extrapolation = 'NOTHING'
                 strip.use_auto_blend = False
                 strip.blend_in = strip.blend_out = 0
+
+                # Speed: NLA scale = 1/speed (scale > 1 slows down).
+                strip.scale = 1.0 / speed
+
+                if looping and source_len > 0:
+                    # Fill the timeline slot; Blender loops the action.
+                    strip.repeat = max(1.0, (duration * speed) / source_len)
+                    strip.extrapolation = 'NOTHING'
+                else:
+                    # Play once, hold last frame for any remaining time.
+                    strip.repeat = 1.0
+                    strip.extrapolation = 'HOLD'
+
+                # Lock frame bounds after setting scale/repeat.  Setting
+                # frame_end last lets Blender keep our exact bounds while
+                # adjusting the effective repeat to match.
+                strip.frame_start = blender_start
+                strip.frame_end = blender_end
+
                 configure_blend(strip, scene_start + start, blend)
+
                 record = dict(scene=definition['id'], character=character['id'], requested=item['clip'],
                               clip=name, start=scene_start + start, end=scene_start + end,
                               source_start=native_start, source_end=native_end,
                               speed=speed, loop=looping, blend_in_frames=blend)
                 records.append(record)
-                intervals.append((strip, record))
                 print('TOONVARA_SCHEDULE:' + json.dumps(record, sort_keys=True))
 
+    # Visibility and camera switching still need a frame-change handler.
     def update_visibility(current_scene):
         frame = current_scene.frame_current + current_scene.frame_subframe - 1
-        # JSON intervals decide both activation and clip-local time.
-        for strip, record in intervals:
-            strip.mute = not (record['start'] <= frame < record['end'])
-            if not strip.mute:
-                elapsed = frame - record['start']
-                strip.strip_time = playback_time(elapsed, record['source_start'], record['source_end'],
-                                                record['speed'], record['loop'])
         for objects, visible, start, end in instances:
             for obj in objects:
                 obj.hide_render = not (visible and start <= frame < end)

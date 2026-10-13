@@ -161,6 +161,13 @@ for obj in bpy.context.scene.objects:
     parent_name = obj.parent.name if obj.parent else "(root)"
     print(f"  - {obj.name}  type={obj.type}  parent={parent_name}")
 
+# --- Armature summary (for model identification) --------------------------
+for obj in bpy.context.scene.objects:
+    if obj.type == 'ARMATURE':
+        bones = [b.name for b in obj.data.bones]
+        print(f"TOONVARA_RIG:{obj.name}:{len(bones)} bones:{', '.join(bones[:8])}"
+              + (f" ... +{len(bones)-8} more" if len(bones) > 8 else ""))
+
 # --- Animation clip assignment --------------------------------------------
 
 if clip_name:

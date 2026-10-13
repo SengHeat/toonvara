@@ -121,6 +121,7 @@ fn main() {
 // Render command
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn run_render(
     file: &Path,
     out: Option<&Path>,
@@ -166,17 +167,38 @@ fn run_render(
             process::exit(1);
         });
 
-    // 5. Locate the adapter script.
+    // 5. Log the resolved action schedule.
+    let total_actions: usize = scenes
+        .iter()
+        .map(|s| s.characters.iter().map(|c| c.actions.len()).sum::<usize>())
+        .sum();
+    if total_actions > 0 {
+        eprintln!("action schedule ({total_actions} actions):");
+        for scene in &scenes {
+            for character in &scene.characters {
+                for action in &character.actions {
+                    let global_start = scene.start_frame + action.start_frame;
+                    let global_end = global_start + action.duration_frames;
+                    eprintln!(
+                        "  {} | {:>10} | frames {:>4}..{:<4} | scene {}",
+                        character.id, action.clip, global_start, global_end, scene.id
+                    );
+                }
+            }
+        }
+    }
+
+    // 6. Locate the adapter script.
     let script = find_adapter_script("render.py");
 
-    // 6. Preflight summary.
+    // 7. Preflight summary.
     eprintln!("project : {}", project.name);
 
     eprintln!("video   : {eff_width}x{eff_height} @ {eff_fps} fps, {frame_count} frames");
     eprintln!("output  : {}", out_path.display());
     eprintln!();
 
-    // 7. Preflight: verify external tools before starting.
+    // 8. Preflight: verify external tools before starting.
     if let Err(e) = studio_render::blender::detect() {
         eprintln!("error: blender not available");
         eprintln!("  {e}");
@@ -191,7 +213,7 @@ fn run_render(
     eprintln!("rendering {frame_count} frames with blender...");
     let start = Instant::now();
 
-    // 8. Run the pipeline.
+    // 9. Run the pipeline.
     let params = VideoPipelineParams {
         blender_script: script,
         out_path: out_path.clone(),
@@ -214,11 +236,13 @@ fn run_render(
             if let Err(error) = std::fs::write(&log_path, &result.blender_log) {
                 eprintln!("warning: could not save render log: {error}");
             }
-            for line in result
-                .blender_log
-                .lines()
-                .filter(|line| line.starts_with("TOONVARA_SCHEDULE:"))
-            {
+            for line in result.blender_log.lines().filter(|line| {
+                line.starts_with("TOONVARA_SCHEDULE:")
+                    || line.starts_with("TOONVARA_IMPORT:")
+                    || line.starts_with("TOONVARA_ARMATURE:")
+                    || line.starts_with("TOONVARA_CLIPS:")
+                    || line.starts_with("TOONVARA_RIG:")
+            }) {
                 println!("{line}");
             }
             println!("render complete: {}", result.output_path.display());
@@ -409,6 +433,11 @@ fn report_render_error(err: &PipelineError) {
             eprintln!("error: character GLB not found");
             eprintln!("  {path}");
             eprintln!("  hint: check that the path in assets.characters is correct");
+        }
+        PipelineError::ClipValidation(detail) => {
+            eprintln!("error: animation clip not found in GLB");
+            eprintln!("  {detail}");
+            eprintln!("  hint: run `toonvara inspect <file>` to see available clips");
         }
     }
 }

@@ -29,6 +29,9 @@ pub enum PipelineError {
 
     #[error("character GLB not found: {path}")]
     CharacterMissing { path: String },
+
+    #[error("clip validation failed: {0}")]
+    ClipValidation(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +105,7 @@ pub fn render_video(params: &VideoPipelineParams) -> Result<VideoPipelineResult,
     result
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_video_inner(
     params: &VideoPipelineParams,
     temp_dir: &Path,
@@ -125,6 +129,51 @@ fn render_video_inner(
             return Err(PipelineError::CharacterMissing {
                 path: glb.display().to_string(),
             });
+        }
+    }
+
+    // 5. Validate scheduled clips against GLB contents.
+    if let Some(scenes) = &params.scenes {
+        let inspect_script = params.blender_script.with_file_name("inspect_glb.py");
+        // Collect unique GLB paths for characters that have actions.
+        let mut seen = std::collections::HashSet::new();
+        let glb_paths: Vec<String> = scenes
+            .iter()
+            .flat_map(|s| &s.characters)
+            .filter(|c| !c.actions.is_empty())
+            .filter(|c| seen.insert(c.asset.clone()))
+            .map(|c| c.asset.clone())
+            .collect();
+
+        if !glb_paths.is_empty() {
+            let mut available = std::collections::HashMap::new();
+            for glb_path in &glb_paths {
+                let info = blender::inspect_glb(&inspect_script, Path::new(glb_path))?;
+                let clip_names: Vec<String> = info.actions.iter().map(|a| a.name.clone()).collect();
+                eprintln!(
+                    "asset {}: {} clip(s): {:?}",
+                    glb_path,
+                    clip_names.len(),
+                    clip_names
+                );
+                available.insert(glb_path.clone(), clip_names);
+            }
+            crate::schedule::validate_clips(scenes, &available)
+                .map_err(PipelineError::ClipValidation)?;
+
+            // Log the resolved schedule.
+            for scene in scenes {
+                for character in &scene.characters {
+                    for action in &character.actions {
+                        let global_start = scene.start_frame + action.start_frame;
+                        let global_end = global_start + action.duration_frames;
+                        eprintln!(
+                            "schedule: {} | {:>10} | frames {:>4}..{:<4} | scene {}",
+                            character.id, action.clip, global_start, global_end, scene.id
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -242,8 +291,16 @@ fn render_command(
     if let Some(scenes) = &params.scenes {
         let manifest = temp_dir.join("schedule.json");
         let json = serde_json::to_vec(scenes).map_err(std::io::Error::other)?;
-        std::fs::write(&manifest, json)?;
-        cmd.env("TOONVARA_SCHEDULE_PATH", manifest);
+        std::fs::write(&manifest, &json)?;
+        // Verify the manifest was written and contains the expected asset paths.
+        let written = std::fs::read(&manifest)?;
+        assert_eq!(json, written, "schedule.json mismatch after write");
+        eprintln!(
+            "schedule manifest: {} ({} bytes)",
+            manifest.display(),
+            json.len()
+        );
+        cmd.env("TOONVARA_SCHEDULE_PATH", &manifest);
     }
     Ok(cmd)
 }

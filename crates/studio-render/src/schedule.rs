@@ -1,6 +1,6 @@
 //! Resolve character assets and validate the supported base-animation timeline.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use studio_core::{CharacterAction, Project, Scene};
@@ -86,6 +86,52 @@ fn interval_end(start: u64, duration: u64, limit: u64) -> Result<u64, String> {
         .ok_or_else(|| {
             format!("invalid interval [{start}, +{duration}): must fit within {limit} frames")
         })
+}
+
+/// Validate that every scheduled action clip exists in the corresponding
+/// character's GLB asset.
+///
+/// `available` maps each resolved (absolute) asset path to the list of
+/// animation clip names found in that file.  If a clip is missing and has no
+/// valid `fallback_clip`, returns an error naming the missing clip, the asset
+/// path, and the clips that *are* available.
+pub fn validate_clips<S: ::std::hash::BuildHasher>(
+    scenes: &[Scene],
+    available: &HashMap<String, Vec<String>, S>,
+) -> Result<(), String> {
+    for scene in scenes {
+        for character in &scene.characters {
+            let Some(clips) = available.get(&character.asset) else {
+                if character.actions.is_empty() {
+                    continue;
+                }
+                return Err(format!(
+                    "character {}: no clip data for asset {}",
+                    character.id, character.asset
+                ));
+            };
+            for action in &character.actions {
+                if clips.iter().any(|c| c == &action.clip) {
+                    continue;
+                }
+                if let Some(fb) = &action.fallback_clip {
+                    if clips.iter().any(|c| c == fb) {
+                        continue;
+                    }
+                    return Err(format!(
+                        "character {}: clip '{}' not found in {} \
+                         (fallback '{}' also missing); available clips: {clips:?}",
+                        character.id, action.clip, character.asset, fb,
+                    ));
+                }
+                return Err(format!(
+                    "character {}: clip '{}' not found in {}; available clips: {clips:?}",
+                    character.id, action.clip, character.asset,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -193,5 +239,89 @@ mod tests {
         third.blend_in_frames = 50;
         actions.push(third);
         assert!(validate_actions(&actions, 450).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_clips tests
+    // -------------------------------------------------------------------
+
+    fn scene_with_actions(asset: &str, clips: &[(&str, Option<&str>)]) -> Vec<Scene> {
+        let actions: Vec<serde_json::Value> = clips
+            .iter()
+            .enumerate()
+            .map(|(i, (clip, fb))| {
+                let mut v = serde_json::json!({
+                    "clip": clip,
+                    "start_frame": i as u64 * 60,
+                    "duration_frames": 60
+                });
+                if let Some(fallback) = fb {
+                    v["fallback_clip"] = serde_json::json!(fallback);
+                }
+                v
+            })
+            .collect();
+        let scene: Scene = serde_json::from_value(serde_json::json!({
+            "id": "s", "start_frame": 0, "duration_frames": 600,
+            "characters": [{"id": "hero", "asset": asset, "actions": actions}]
+        }))
+        .unwrap();
+        vec![scene]
+    }
+
+    #[test]
+    fn validate_clips_accepts_all_present() {
+        let scenes = scene_with_actions("/hero.glb", &[("walk", None), ("wave", None)]);
+        let available = HashMap::from([(
+            "/hero.glb".to_string(),
+            vec!["walk".into(), "wave".into(), "idle".into()],
+        )]);
+        assert!(validate_clips(&scenes, &available).is_ok());
+    }
+
+    #[test]
+    fn validate_clips_rejects_missing_clip() {
+        let scenes = scene_with_actions("/hero.glb", &[("walk", None), ("jump", None)]);
+        let available =
+            HashMap::from([("/hero.glb".to_string(), vec!["walk".into(), "idle".into()])]);
+        let err = validate_clips(&scenes, &available).unwrap_err();
+        assert!(err.contains("jump"), "should name missing clip: {err}");
+        assert!(err.contains("/hero.glb"), "should name the GLB: {err}");
+        assert!(err.contains("walk"), "should list available clips: {err}");
+    }
+
+    #[test]
+    fn validate_clips_accepts_valid_fallback() {
+        let scenes = scene_with_actions("/hero.glb", &[("jump", Some("idle"))]);
+        let available =
+            HashMap::from([("/hero.glb".to_string(), vec!["walk".into(), "idle".into()])]);
+        assert!(validate_clips(&scenes, &available).is_ok());
+    }
+
+    #[test]
+    fn validate_clips_rejects_missing_fallback() {
+        let scenes = scene_with_actions("/hero.glb", &[("jump", Some("run"))]);
+        let available =
+            HashMap::from([("/hero.glb".to_string(), vec!["walk".into(), "idle".into()])]);
+        let err = validate_clips(&scenes, &available).unwrap_err();
+        assert!(err.contains("jump"), "{err}");
+        assert!(err.contains("run"), "should name missing fallback: {err}");
+    }
+
+    #[test]
+    fn validate_clips_skips_characters_without_actions() {
+        let scene: Scene = serde_json::from_value(serde_json::json!({
+            "id": "s", "start_frame": 0, "duration_frames": 60,
+            "characters": [{"id": "bg", "asset": "/bg.glb"}]
+        }))
+        .unwrap();
+        assert!(validate_clips(&[scene], &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn validate_clips_errors_when_asset_has_no_clip_data() {
+        let scenes = scene_with_actions("/hero.glb", &[("walk", None)]);
+        let err = validate_clips(&scenes, &HashMap::new()).unwrap_err();
+        assert!(err.contains("no clip data"), "{err}");
     }
 }
