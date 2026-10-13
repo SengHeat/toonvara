@@ -43,6 +43,14 @@ pub fn resolve(project: &Project, base: &Path, frames: u32) -> Result<Vec<Scene>
             validate_actions(&character.actions, scene.duration_frames)
                 .map_err(|error| format!("character {}: {error}", character.id))?;
         }
+        // Resolve audio paths to absolute.
+        for audio in &mut scene.audio {
+            let abs = base
+                .join(&audio.path)
+                .canonicalize()
+                .map_err(|e| format!("audio asset {}: {e}", audio.path))?;
+            audio.path = abs.to_string_lossy().into_owned();
+        }
     }
     Ok(scenes)
 }

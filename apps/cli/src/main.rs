@@ -439,6 +439,11 @@ fn report_render_error(err: &PipelineError) {
             eprintln!("  {detail}");
             eprintln!("  hint: run `toonvara inspect <file>` to see available clips");
         }
+        PipelineError::AudioMissing { path } => {
+            eprintln!("error: audio file not found");
+            eprintln!("  {path}");
+            eprintln!("  hint: place the audio file at the path listed in the JSON, relative to the JSON file");
+        }
     }
 }
 

@@ -30,6 +30,9 @@ pub enum FfmpegError {
 
     #[error("ffprobe failed or returned unparseable output: {detail}")]
     ProbeFailed { detail: String },
+
+    #[error("audio file not found: {path}")]
+    AudioMissing { path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +88,26 @@ pub struct ProbeInfo {
     pub r_frame_rate: String,
     /// Frame rate as a float (e.g. 30.0).
     pub fps: f64,
+    /// Whether the file contains at least one audio stream.
+    pub has_audio: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Public types — audio mux
+// ---------------------------------------------------------------------------
+
+/// Parameters for muxing an audio track into a video-only MP4.
+pub struct MuxAudioParams {
+    /// Path to the video-only MP4.
+    pub video_path: PathBuf,
+    /// Path to the audio file (.wav or .mp3).
+    pub audio_path: PathBuf,
+    /// Output MP4 path (with both streams).
+    pub out_path: PathBuf,
+    /// Delay before audio starts, in seconds.
+    pub delay_secs: f64,
+    /// Volume multiplier (0.0–1.0).
+    pub volume: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +198,96 @@ pub fn encode(params: &EncodeParams) -> Result<EncodeResult, FfmpegError> {
 }
 
 // ---------------------------------------------------------------------------
+// Audio mux
+// ---------------------------------------------------------------------------
+
+/// Combine a video-only MP4 with a single audio file.
+///
+/// Applies an optional delay (via the `adelay` filter) and volume adjustment
+/// (via the `volume` filter). The video stream is copied without re-encoding.
+///
+/// # Errors
+///
+/// Returns [`FfmpegError::AudioMissing`] if the audio file does not exist,
+/// or [`FfmpegError::EncodeFailed`] if `FFmpeg` exits non-zero.
+pub fn mux_audio(params: &MuxAudioParams) -> Result<EncodeResult, FfmpegError> {
+    if !params.audio_path.is_file() {
+        return Err(FfmpegError::AudioMissing {
+            path: params.audio_path.display().to_string(),
+        });
+    }
+
+    let ffmpeg = find_executable("ffmpeg")?;
+
+    if let Some(parent) = params.out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Build the audio filter chain: delay then volume.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let delay_ms = (params.delay_secs * 1000.0).round() as u64;
+    let vol = params.volume;
+    let filter = if delay_ms > 0 && (vol - 1.0).abs() > f64::EPSILON {
+        format!("adelay={delay_ms}|{delay_ms},volume={vol}")
+    } else if delay_ms > 0 {
+        format!("adelay={delay_ms}|{delay_ms}")
+    } else if (vol - 1.0).abs() > f64::EPSILON {
+        format!("volume={vol}")
+    } else {
+        String::new()
+    };
+
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(params.video_path.as_os_str())
+        .arg("-i")
+        .arg(params.audio_path.as_os_str())
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0");
+
+    if filter.is_empty() {
+        cmd.arg("-c:a").arg("aac");
+    } else {
+        cmd.arg("-af").arg(&filter);
+    }
+
+    // Ensure the output is no shorter than the video.
+    cmd.arg("-shortest");
+    cmd.arg(params.out_path.as_os_str());
+
+    let output = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if !output.status.success() {
+        return Err(FfmpegError::EncodeFailed {
+            status: output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            stdout,
+            stderr,
+        });
+    }
+
+    let meta = std::fs::metadata(&params.out_path).map_err(|e| FfmpegError::ProbeFailed {
+        detail: format!("muxed output missing after encode: {e}"),
+    })?;
+
+    Ok(EncodeResult {
+        output_path: params.out_path.clone(),
+        output_size: meta.len(),
+        stdout,
+        stderr,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Probe
 // ---------------------------------------------------------------------------
 
@@ -187,6 +300,7 @@ pub fn encode(params: &EncodeParams) -> Result<EncodeResult, FfmpegError> {
 pub fn probe(path: &Path) -> Result<ProbeInfo, FfmpegError> {
     let ffprobe = find_executable("ffprobe")?;
 
+    // Query video stream metadata.
     let output = Command::new(&ffprobe)
         .arg("-v")
         .arg("error")
@@ -206,7 +320,28 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, FfmpegError> {
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-    parse_probe_json(&json_str)
+    let mut info = parse_probe_json(&json_str)?;
+
+    // Check for audio stream presence (separate query to avoid mixing streams).
+    let audio_output = Command::new(&ffprobe)
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")
+        .arg("-show_entries")
+        .arg("stream=codec_type")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path.as_os_str())
+        .output()?;
+
+    info.has_audio = audio_output.status.success() && !output_is_empty(&audio_output.stdout);
+
+    Ok(info)
+}
+
+fn output_is_empty(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
 }
 
 /// Parse the JSON emitted by `ffprobe -of json`.
@@ -234,6 +369,7 @@ fn parse_probe_json(json: &str) -> Result<ProbeInfo, FfmpegError> {
         duration_secs,
         r_frame_rate,
         fps,
+        has_audio: false, // Caller upgrades via the audio-stream query.
     })
 }
 
@@ -395,5 +531,6 @@ mod tests {
         assert_eq!(info.height, 240);
         assert!((info.duration_secs - 1.0).abs() < 0.01);
         assert!((info.fps - 30.0).abs() < 0.01);
+        assert!(!info.has_audio); // parse_probe_json defaults to false
     }
 }

@@ -32,6 +32,9 @@ pub enum PipelineError {
 
     #[error("clip validation failed: {0}")]
     ClipValidation(String),
+
+    #[error("audio file not found: {path}")]
+    AudioMissing { path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -208,19 +211,51 @@ fn render_video_inner(
         });
     }
 
-    // 7. Encode with FFmpeg.
+    // 7. Encode video with FFmpeg.
     let input_pattern = format!("{}%04d.png", frame_prefix.display());
+    let video_only_path = if first_audio_clip(params).is_some() {
+        // We'll mux audio in a second pass; encode video to a temp file first.
+        temp_dir.join("video_only.mp4")
+    } else {
+        params.out_path.clone()
+    };
     let encode_result = ffmpeg::encode(&ffmpeg::EncodeParams {
         input_pattern,
         start_number: 1,
-        out_path: params.out_path.clone(),
+        out_path: video_only_path.clone(),
         fps: params.fps,
     })?;
+    let mut ffmpeg_log = encode_result.stderr;
 
-    // 8. Probe the output.
+    // 8. Mux first audio clip (if present).
+    if let Some((audio, scene_start)) = first_audio_clip(params) {
+        let audio_path = Path::new(&audio.path);
+        if !audio_path.is_file() {
+            return Err(PipelineError::AudioMissing {
+                path: audio.path.clone(),
+            });
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let delay_secs = (scene_start + audio.start_frame) as f64 / f64::from(params.fps);
+        eprintln!(
+            "audio: muxing {} (type={:?}, delay={delay_secs:.2}s, vol={:.2})",
+            audio.path, audio.audio_type, audio.volume,
+        );
+        let mux_result = ffmpeg::mux_audio(&ffmpeg::MuxAudioParams {
+            video_path: video_only_path.clone(),
+            audio_path: audio_path.to_path_buf(),
+            out_path: params.out_path.clone(),
+            delay_secs,
+            volume: audio.volume,
+        })?;
+        ffmpeg_log.push('\n');
+        ffmpeg_log.push_str(&mux_result.stderr);
+    }
+
+    // 9. Probe the output.
     let probe = ffmpeg::probe(&params.out_path)?;
 
-    // 9. Basic sanity checks.
+    // 10. Basic sanity checks.
     if probe.width != params.width || probe.height != params.height {
         return Err(PipelineError::VerifyFailed {
             detail: format!(
@@ -240,13 +275,33 @@ fn render_video_inner(
         });
     }
 
+    if first_audio_clip(params).is_some() && !probe.has_audio {
+        return Err(PipelineError::VerifyFailed {
+            detail: "audio track was muxed but output has no audio stream".to_string(),
+        });
+    }
+
+    let final_size =
+        std::fs::metadata(&params.out_path).map_or(encode_result.output_size, |m| m.len());
+
     Ok(VideoPipelineResult {
         output_path: params.out_path.clone(),
-        output_size: encode_result.output_size,
+        output_size: final_size,
         probe,
         blender_log,
-        ffmpeg_log: encode_result.stderr,
+        ffmpeg_log,
     })
+}
+
+/// Return the first audio clip from the resolved scenes, along with its
+/// scene's global start frame (so the audio delay can be computed).
+fn first_audio_clip(params: &VideoPipelineParams) -> Option<(&studio_core::AudioClip, u64)> {
+    params
+        .scenes
+        .as_ref()?
+        .iter()
+        .flat_map(|s| s.audio.iter().map(move |a| (a, s.start_frame)))
+        .next()
 }
 
 fn render_command(
