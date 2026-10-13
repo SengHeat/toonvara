@@ -7,3 +7,4 @@
 pub mod blender;
 pub mod ffmpeg;
 pub mod pipeline;
+pub mod schedule;

@@ -3,7 +3,11 @@
     "allow": [
       "Bash(source \"$HOME/.cargo/env\")",
       "Bash(rm -f /tmp/toonvara_demo.mp4)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(TOONVARA_OUT_PATH=/tmp/toonvara_char_frame2.png TOONVARA_RES_X=160 TOONVARA_RES_Y=120 TOONVARA_CHARACTER_GLB=/Users/macbook/Automation-Workplace/cartoon-studio/examples/assets/characters/hero.glb blender --background --python adapters/blender/render.py)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }

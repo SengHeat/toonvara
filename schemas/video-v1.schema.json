@@ -219,6 +219,28 @@
           "minLength": 1,
           "description": "Animation clip name. Must exist in the character's available clips."
         },
+        "fallback_clip": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Explicit replacement clip if clip is missing. The fallback must exist."
+        },
+        "speed": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.0,
+          "description": "Finite positive source-animation speed multiplier. Scheduled start and duration do not change."
+        },
+        "loop": {
+          "type": "boolean",
+          "default": true,
+          "description": "Wrap source animation time; false plays once and holds the last pose until the scheduled end."
+        },
+        "blend_in_frames": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Fade-in duration in timeline frames (less than duration_frames), independent of speed. Overlaps must exactly match this duration; at most two actions may overlap."
+        },
         "start_frame": {
           "type": "integer",
           "minimum": 0,

@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "project": {
+    "name": "Action Speed Demo",
+    "seed": 42
+  },
+  "video": {
+    "duration_seconds": 15,
+    "fps": 30,
+    "width": 640,
+    "height": 360
+  },
+  "assets": {
+    "characters": {
+      "hero": "assets/characters/hero_actions.glb"
+    }
+  },
+  "scenes": [
+    {
+      "id": "scene_001",
+      "start_frame": 0,
+      "duration_frames": 450,
+      "environment": "forest_day",
+      "characters": [
+        {
+          "id": "hero_01",
+          "asset": "hero",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "actions": [
+            {
+              "clip": "wave",
+              "start_frame": 0,
+              "duration_frames": 90,
+              "speed": 0.5,
+              "loop": true
+            },
+            {
+              "clip": "wave",
+              "start_frame": 90,
+              "duration_frames": 90,
+              "speed": 1.0,
+              "loop": true
+            },
+            {
+              "clip": "wave",
+              "start_frame": 180,
+              "duration_frames": 90,
+              "speed": 1.5,
+              "loop": true
+            },
+            {
+              "clip": "wave",
+              "start_frame": 270,
+              "duration_frames": 90,
+              "speed": 2.0,
+              "loop": true
+            },
+            {
+              "clip": "jump",
+              "start_frame": 360,
+              "duration_frames": 90,
+              "speed": 2.0,
+              "loop": false
+            }
+          ]
+        }
+      ],
+      "camera": {
+        "projection": "perspective",
+        "position": [
+          2.8,
+          1.6,
+          3.0
+        ],
+        "target": [
+          0,
+          0.65,
+          0
+        ]
+      }
+    }
+  ],
+  "output": {
+    "format": "mp4",
+    "path": "target/speed-verification/speed_demo.mp4"
+  }
+}

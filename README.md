@@ -659,7 +659,7 @@ These commands are requirements, not currently implemented functionality.
       },
       "assets": {
         "characters": {
-          "hero": "assets/characters/hero.glb"
+          "hero": "assets/characters/hero_actions.glb"
         }
       },
       "scenes": [
@@ -699,8 +699,8 @@ These commands are requirements, not currently implemented functionality.
           ],
           "camera": {
             "projection": "perspective",
-            "position": [0, 2, 6],
-            "target": [0, 1, 0]
+            "position": [2.8, 1.6, 3.0],
+            "target": [0, 0.65, 0]
           }
         }
       ],
@@ -747,6 +747,19 @@ The engine must define predictable behavior when commands overlap.
 - Simultaneous position tracks must not overwrite each other unpredictably.
 - Missing animations must return an error unless an explicit fallback is configured.
 - Root motion and explicit movement tracks must not apply duplicate displacement.
+
+Current adapter behavior: scene-relative action intervals are sorted by start
+and stop at their exclusive end. Optional `speed` (default `1.0`) changes source
+animation time without changing these intervals. Optional `loop` (default
+`true`) wraps the clip; `false` holds the last pose after one playback.
+`blend_in_frames` (default `0`) provides a smooth incoming crossfade measured
+in timeline frames, independent of speed. An overlap must exactly equal the
+incoming fade duration; undeclared overlaps, three-way overlaps, and overlapping
+scenes are rejected. Missing clips error before rendering unless that action sets
+`"fallback_clip": "idle"` (the fallback itself must exist). Clips use exact,
+case-sensitive names. Character placement is applied once on a parent object.
+See [adapter usage and verification](adapters/blender/README.md).
+
 
 ### 6.7 JSON Versioning
 

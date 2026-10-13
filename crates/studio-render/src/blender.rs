@@ -86,6 +86,13 @@ pub struct RenderParams {
     pub camera_pos: [f32; 3],
     /// Camera look-at target (Y-up, right-handed).
     pub camera_target: [f32; 3],
+    /// Optional absolute path to a `.glb` character file.
+    /// When set, Blender imports this instead of the fallback cube.
+    pub character_glb: Option<PathBuf>,
+    /// Character position in Y-up coords (used when `character_glb` is set).
+    pub character_pos: [f32; 3],
+    /// Optional animation clip (action) name to play on the armature.
+    pub animation_clip: Option<String>,
 }
 
 /// Successful render result.
@@ -159,8 +166,9 @@ pub fn render_single_frame(params: &RenderParams) -> Result<RenderResult, Render
     }
 
     // 4. Build the command — only fixed args, data via env vars.
-    let output = Command::new(&info.path)
-        .arg("--background")
+    let mut cmd = Command::new(&info.path);
+    cmd.arg("--background")
+        .args(["--python-exit-code", "1"])
         .arg("--python")
         .arg(&params.script_path)
         // Scene parameters via environment — safe, no injection possible.
@@ -174,9 +182,27 @@ pub fn render_single_frame(params: &RenderParams) -> Result<RenderResult, Render
         .env("TOONVARA_CAM_TGT_Y", params.camera_target[1].to_string())
         .env("TOONVARA_CAM_TGT_Z", params.camera_target[2].to_string())
         // Suppress Blender GUI on Linux.
-        .env("DISPLAY", "")
-        .output()
-        .map_err(BlenderError::from)?;
+        .env("DISPLAY", "");
+    cmd.env_remove("TOONVARA_SCHEDULE_PATH")
+        .env_remove("TOONVARA_FRAME_START")
+        .env_remove("TOONVARA_FRAME_END")
+        .env_remove("TOONVARA_CHARACTER_GLB")
+        .env_remove("TOONVARA_CLIP");
+
+    // Optional character GLB.
+    if let Some(glb) = &params.character_glb {
+        cmd.env("TOONVARA_CHARACTER_GLB", glb.to_string_lossy().as_ref())
+            .env("TOONVARA_CHAR_POS_X", params.character_pos[0].to_string())
+            .env("TOONVARA_CHAR_POS_Y", params.character_pos[1].to_string())
+            .env("TOONVARA_CHAR_POS_Z", params.character_pos[2].to_string());
+    }
+
+    // Optional animation clip.
+    if let Some(clip) = &params.animation_clip {
+        cmd.env("TOONVARA_CLIP", clip);
+    }
+
+    let output = cmd.output().map_err(BlenderError::from)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -209,6 +235,145 @@ pub fn render_single_frame(params: &RenderParams) -> Result<RenderResult, Render
         stdout,
         stderr,
     })
+}
+
+// ---------------------------------------------------------------------------
+// GLB inspection
+// ---------------------------------------------------------------------------
+
+/// Metadata extracted from a GLB file by the Blender inspect adapter.
+#[derive(Debug, Clone, Default)]
+pub struct GlbInfo {
+    pub object_count: u32,
+    pub mesh_count: u32,
+    pub armatures: Vec<ArmatureInfo>,
+    pub actions: Vec<ActionInfo>,
+}
+
+/// An armature found in the GLB.
+#[derive(Debug, Clone)]
+pub struct ArmatureInfo {
+    pub name: String,
+    pub bone_count: u32,
+    pub bones: Vec<String>,
+}
+
+/// An animation action found in the GLB.
+#[derive(Debug, Clone)]
+pub struct ActionInfo {
+    pub name: String,
+    pub frame_start: i32,
+    pub frame_end: i32,
+}
+
+/// Inspect a GLB file via Blender and return its rig/animation metadata.
+///
+/// Launches `blender --background --python inspect_glb.py` and parses the
+/// structured `TOONVARA_INSPECT:` lines from stdout.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] if Blender is missing, the script is missing,
+/// the process fails, or the output cannot be parsed.
+pub fn inspect_glb(inspect_script: &Path, glb_path: &Path) -> Result<GlbInfo, RenderError> {
+    let info = detect()?;
+
+    if !inspect_script.is_file() {
+        return Err(RenderError::ScriptNotFound {
+            path: inspect_script.display().to_string(),
+        });
+    }
+
+    let output = Command::new(&info.path)
+        .arg("--background")
+        .arg("--python")
+        .arg(inspect_script)
+        .env("TOONVARA_GLB_PATH", glb_path.to_string_lossy().as_ref())
+        .env("DISPLAY", "")
+        .output()
+        .map_err(BlenderError::from)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(RenderError::ProcessFailed {
+            status: output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            stdout: stdout.into_owned(),
+            stderr: stderr.into_owned(),
+        });
+    }
+
+    Ok(parse_inspect_output(&stdout))
+}
+
+/// Parse `TOONVARA_INSPECT:` lines from Blender stdout.
+fn parse_inspect_output(stdout: &str) -> GlbInfo {
+    let mut info = GlbInfo::default();
+    // Temporary map: armature name → (bone_count, bones vec)
+    let mut arm_map: std::collections::HashMap<String, (u32, Vec<String>)> =
+        std::collections::HashMap::new();
+
+    for line in stdout.lines() {
+        let Some(payload) = line.strip_prefix("TOONVARA_INSPECT:") else {
+            continue;
+        };
+        let parts: Vec<&str> = payload.splitn(4, ':').collect();
+        match parts.first().copied() {
+            Some("object_count") => {
+                info.object_count = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            Some("mesh_count") => {
+                info.mesh_count = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            Some("armature") => {
+                if let (Some(name), Some(bc)) = (parts.get(1), parts.get(2)) {
+                    let bone_count: u32 = bc.parse().unwrap_or(0);
+                    arm_map
+                        .entry((*name).to_string())
+                        .or_insert_with(|| (bone_count, Vec::new()))
+                        .0 = bone_count;
+                }
+            }
+            Some("bone") => {
+                if let (Some(arm), Some(bone)) = (parts.get(1), parts.get(2)) {
+                    arm_map
+                        .entry((*arm).to_string())
+                        .or_insert_with(|| (0, Vec::new()))
+                        .1
+                        .push((*bone).to_string());
+                }
+            }
+            Some("action") => {
+                if let (Some(name), Some(fs), Some(fe)) = (parts.get(1), parts.get(2), parts.get(3))
+                {
+                    info.actions.push(ActionInfo {
+                        name: (*name).to_string(),
+                        frame_start: fs.parse().unwrap_or(0),
+                        frame_end: fe.parse().unwrap_or(0),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Flatten arm_map into sorted vec.
+    let mut arms: Vec<_> = arm_map.into_iter().collect();
+    arms.sort_by(|a, b| a.0.cmp(&b.0));
+    info.armatures = arms
+        .into_iter()
+        .map(|(name, (bone_count, bones))| ArmatureInfo {
+            name,
+            bone_count,
+            bones,
+        })
+        .collect();
+
+    info
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +527,9 @@ mod tests {
             height: 240,
             camera_pos: [0.0, 2.0, 6.0],
             camera_target: [0.0, 1.0, 0.0],
+            character_glb: None,
+            character_pos: [0.0, 0.0, 0.0],
+            animation_clip: None,
         };
         let err = render_single_frame(&params);
         // Either ScriptNotFound (if Blender is installed) or Detection
@@ -388,6 +556,9 @@ mod tests {
             height: 240,
             camera_pos: [0.0, 2.0, 6.0],
             camera_target: [0.0, 1.0, 0.0],
+            character_glb: None,
+            character_pos: [0.0, 0.0, 0.0],
+            animation_clip: None,
         };
 
         let result = render_single_frame(&params).expect("render should succeed");
@@ -397,5 +568,40 @@ mod tests {
         // Clean up.
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_dir(&out_dir);
+    }
+
+    #[test]
+    fn parse_inspect_output_full() {
+        let stdout = "\
+Blender 5.2 ...\n\
+TOONVARA_INSPECT:object_count:42\n\
+TOONVARA_INSPECT:mesh_count:40\n\
+TOONVARA_INSPECT:armature:HeroRig:65\n\
+TOONVARA_INSPECT:bone:HeroRig:Hips\n\
+TOONVARA_INSPECT:bone:HeroRig:Spine\n\
+TOONVARA_INSPECT:action:walk:1:30\n\
+TOONVARA_INSPECT:action:wave:1:20\n\
+TOONVARA_INSPECT:done\n";
+        let info = parse_inspect_output(stdout);
+        assert_eq!(info.object_count, 42);
+        assert_eq!(info.mesh_count, 40);
+        assert_eq!(info.armatures.len(), 1);
+        assert_eq!(info.armatures[0].name, "HeroRig");
+        assert_eq!(info.armatures[0].bone_count, 65);
+        assert_eq!(info.armatures[0].bones, vec!["Hips", "Spine"]);
+        assert_eq!(info.actions.len(), 2);
+        assert_eq!(info.actions[0].name, "walk");
+        assert_eq!(info.actions[0].frame_start, 1);
+        assert_eq!(info.actions[0].frame_end, 30);
+        assert_eq!(info.actions[1].name, "wave");
+    }
+
+    #[test]
+    fn parse_inspect_output_empty() {
+        let stdout = "TOONVARA_INSPECT:object_count:5\nTOONVARA_INSPECT:mesh_count:5\nTOONVARA_INSPECT:done\n";
+        let info = parse_inspect_output(stdout);
+        assert_eq!(info.object_count, 5);
+        assert!(info.armatures.is_empty());
+        assert!(info.actions.is_empty());
     }
 }

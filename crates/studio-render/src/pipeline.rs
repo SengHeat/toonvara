@@ -26,6 +26,9 @@ pub enum PipelineError {
 
     #[error("probe check failed: {detail}")]
     VerifyFailed { detail: String },
+
+    #[error("character GLB not found: {path}")]
+    CharacterMissing { path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +37,8 @@ pub enum PipelineError {
 
 /// Parameters for the full render-to-MP4 pipeline.
 pub struct VideoPipelineParams {
+    /// Resolved JSON scenes; when present these take precedence over the single clip.
+    pub scenes: Option<Vec<studio_core::Scene>>,
     /// Path to `adapters/blender/render.py`.
     pub blender_script: PathBuf,
     /// Final MP4 output path.
@@ -50,6 +55,12 @@ pub struct VideoPipelineParams {
     pub camera_pos: [f32; 3],
     /// Camera look-at target (Y-up).
     pub camera_target: [f32; 3],
+    /// Optional absolute path to a `.glb` character file.
+    pub character_glb: Option<PathBuf>,
+    /// Character position in Y-up coords.
+    pub character_pos: [f32; 3],
+    /// Optional animation clip (action) name to play.
+    pub animation_clip: Option<String>,
 }
 
 /// Successful pipeline result.
@@ -108,23 +119,18 @@ fn render_video_inner(
         .into());
     }
 
-    // 4. Run Blender headless — render frame sequence.
-    let blender_output = std::process::Command::new(&blender_info.path)
-        .arg("--background")
-        .arg("--python")
-        .arg(&params.blender_script)
-        .env("TOONVARA_OUT_PATH", frame_prefix.to_string_lossy().as_ref())
-        .env("TOONVARA_RES_X", params.width.to_string())
-        .env("TOONVARA_RES_Y", params.height.to_string())
-        .env("TOONVARA_FRAME_START", "1")
-        .env("TOONVARA_FRAME_END", params.frame_count.to_string())
-        .env("TOONVARA_CAM_POS_X", params.camera_pos[0].to_string())
-        .env("TOONVARA_CAM_POS_Y", params.camera_pos[1].to_string())
-        .env("TOONVARA_CAM_POS_Z", params.camera_pos[2].to_string())
-        .env("TOONVARA_CAM_TGT_X", params.camera_target[0].to_string())
-        .env("TOONVARA_CAM_TGT_Y", params.camera_target[1].to_string())
-        .env("TOONVARA_CAM_TGT_Z", params.camera_target[2].to_string())
-        .env("DISPLAY", "")
+    // 4. Validate character GLB if provided.
+    if let Some(glb) = &params.character_glb {
+        if !glb.is_file() {
+            return Err(PipelineError::CharacterMissing {
+                path: glb.display().to_string(),
+            });
+        }
+    }
+
+    let mut cmd = render_command(params, &blender_info.path, temp_dir, &frame_prefix)?;
+
+    let blender_output = cmd
         .output()
         .map_err(|e| blender::RenderError::from(blender::BlenderError::from(e)))?;
 
@@ -144,7 +150,7 @@ fn render_video_inner(
         .into());
     }
 
-    // 5. Verify all expected frames exist.
+    // 6. Verify all expected frames exist.
     let found = count_frames(temp_dir, "frame_");
     if found < params.frame_count {
         return Err(PipelineError::FrameCountMismatch {
@@ -153,7 +159,7 @@ fn render_video_inner(
         });
     }
 
-    // 6. Encode with FFmpeg.
+    // 7. Encode with FFmpeg.
     let input_pattern = format!("{}%04d.png", frame_prefix.display());
     let encode_result = ffmpeg::encode(&ffmpeg::EncodeParams {
         input_pattern,
@@ -162,10 +168,10 @@ fn render_video_inner(
         fps: params.fps,
     })?;
 
-    // 7. Probe the output.
+    // 8. Probe the output.
     let probe = ffmpeg::probe(&params.out_path)?;
 
-    // 8. Basic sanity checks.
+    // 9. Basic sanity checks.
     if probe.width != params.width || probe.height != params.height {
         return Err(PipelineError::VerifyFailed {
             detail: format!(
@@ -192,6 +198,54 @@ fn render_video_inner(
         blender_log,
         ffmpeg_log: encode_result.stderr,
     })
+}
+
+fn render_command(
+    params: &VideoPipelineParams,
+    executable: &Path,
+    temp_dir: &Path,
+    frame_prefix: &Path,
+) -> Result<std::process::Command, PipelineError> {
+    let mut cmd = std::process::Command::new(executable);
+    cmd.arg("--background")
+        .args(["--python-exit-code", "1"])
+        .arg("--python")
+        .arg(&params.blender_script)
+        .env("TOONVARA_OUT_PATH", frame_prefix.to_string_lossy().as_ref())
+        .env("TOONVARA_RES_X", params.width.to_string())
+        .env("TOONVARA_RES_Y", params.height.to_string())
+        .env("TOONVARA_FRAME_START", "1")
+        .env("TOONVARA_FRAME_END", params.frame_count.to_string())
+        .env("TOONVARA_FPS", params.fps.to_string())
+        .env("TOONVARA_CAM_POS_X", params.camera_pos[0].to_string())
+        .env("TOONVARA_CAM_POS_Y", params.camera_pos[1].to_string())
+        .env("TOONVARA_CAM_POS_Z", params.camera_pos[2].to_string())
+        .env("TOONVARA_CAM_TGT_X", params.camera_target[0].to_string())
+        .env("TOONVARA_CAM_TGT_Y", params.camera_target[1].to_string())
+        .env("TOONVARA_CAM_TGT_Z", params.camera_target[2].to_string())
+        .env("DISPLAY", "");
+
+    cmd.env(
+        "TOONVARA_CLIP",
+        params.animation_clip.as_deref().unwrap_or(""),
+    );
+    cmd.env_remove("TOONVARA_CHARACTER_GLB");
+
+    if let Some(glb) = &params.character_glb {
+        cmd.env("TOONVARA_CHARACTER_GLB", glb.to_string_lossy().as_ref())
+            .env("TOONVARA_CHAR_POS_X", params.character_pos[0].to_string())
+            .env("TOONVARA_CHAR_POS_Y", params.character_pos[1].to_string())
+            .env("TOONVARA_CHAR_POS_Z", params.character_pos[2].to_string());
+    }
+
+    cmd.env_remove("TOONVARA_SCHEDULE_PATH");
+    if let Some(scenes) = &params.scenes {
+        let manifest = temp_dir.join("schedule.json");
+        let json = serde_json::to_vec(scenes).map_err(std::io::Error::other)?;
+        std::fs::write(&manifest, json)?;
+        cmd.env("TOONVARA_SCHEDULE_PATH", manifest);
+    }
+    Ok(cmd)
 }
 
 /// Count files matching `{prefix}NNNN.png` in a directory.
@@ -244,6 +298,7 @@ mod tests {
         let _ = std::fs::remove_file(&out_mp4);
 
         let params = VideoPipelineParams {
+            scenes: None,
             blender_script: script,
             out_path: out_mp4.clone(),
             width: 320,
@@ -252,6 +307,9 @@ mod tests {
             frame_count: 30,
             camera_pos: [0.0, 2.0, 6.0],
             camera_target: [0.0, 1.0, 0.0],
+            character_glb: None,
+            character_pos: [0.0, 0.0, 0.0],
+            animation_clip: None,
         };
 
         let result = render_video(&params).expect("pipeline should succeed");

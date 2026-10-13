@@ -2925,6 +2925,8 @@ dependencies = [
 name = "studio-render"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+ "studio-core",
  "thiserror 2.0.21",
 ]
 

@@ -140,8 +140,39 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CharacterAction {
     pub clip: String,
+    /// Source-animation time multiplier; never changes the scheduled interval.
+    #[serde(
+        default = "default_action_speed",
+        deserialize_with = "deserialize_action_speed"
+    )]
+    pub speed: f64,
+    /// Wrap at the source clip end; false holds its final pose instead.
+    #[serde(rename = "loop", default = "default_true")]
+    pub looping: bool,
+    /// Timeline frames spent fading in. An overlap must match this duration.
+    #[serde(default)]
+    pub blend_in_frames: u64,
+    /// Explicit replacement if `clip` is absent from this character's asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_clip: Option<String>,
     pub start_frame: u64,
     pub duration_frames: u64,
+}
+
+fn default_action_speed() -> f64 {
+    1.0
+}
+
+fn deserialize_action_speed<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let speed = f64::deserialize(deserializer)?;
+    if !speed.is_finite() || speed <= 0.0 {
+        return Err(serde::de::Error::custom(
+            "action speed must be finite and greater than zero",
+        ));
+    }
+    Ok(speed)
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +217,46 @@ pub const SCHEMA_VERSION: &str = "1.0";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_actions_keep_native_looping_playback() {
+        let action: CharacterAction =
+            serde_json::from_str(r#"{"clip":"walk","start_frame":120,"duration_frames":60}"#)
+                .unwrap();
+        assert!((action.speed - 1.0).abs() < f64::EPSILON);
+        assert!(action.looping);
+        assert_eq!(action.blend_in_frames, 0);
+        assert_eq!((action.start_frame, action.duration_frames), (120, 60));
+    }
+
+    #[test]
+    fn action_playback_options_roundtrip() {
+        for speed in [0.5, 1.0, 1.5, 2.0] {
+            let value = serde_json::json!({"clip": "jump", "start_frame": 30, "duration_frames": 60,
+                "speed": speed, "loop": false, "blend_in_frames": 10});
+            let action: CharacterAction = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(&action).unwrap();
+            let decoded: CharacterAction = serde_json::from_value(encoded).unwrap();
+            assert!((decoded.speed - speed).abs() < f64::EPSILON);
+            assert!(!decoded.looping);
+            assert_eq!(decoded.blend_in_frames, 10);
+        }
+    }
+
+    #[test]
+    fn invalid_action_speeds_are_rejected_during_deserialization() {
+        for speed in [
+            "0", "-1", "null", "true", "\"1.5\"", "1e309", "NaN", "Infinity",
+        ] {
+            let json = format!(
+                r#"{{"clip":"walk","start_frame":0,"duration_frames":60,"speed":{speed}}}"#
+            );
+            assert!(
+                serde_json::from_str::<CharacterAction>(&json).is_err(),
+                "accepted {speed}"
+            );
+        }
+    }
 
     #[test]
     fn default_output_format_roundtrips() {

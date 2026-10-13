@@ -7,6 +7,8 @@ description = "Rendering orchestration and external tool integration for Toonvar
 
 [dependencies]
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+studio-core = { path = "../studio-core" }
 
 [lints]
 workspace = true
