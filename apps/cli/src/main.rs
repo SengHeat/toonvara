@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
+use studio_json::ParseError;
 
 /// Toonvara — cartoon video generator (CLI)
 #[derive(Parser)]
@@ -59,7 +60,7 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -71,14 +72,30 @@ fn main() -> Result<()> {
             );
             eprintln!("Not yet implemented.");
         }
-        Commands::Validate { file } => {
-            eprintln!("toonvara validate: {}", file.display());
-            let contents = std::fs::read_to_string(&file)?;
-            // Phase 0: just parse to confirm valid JSON, real validation in Phase 2
-            let _: serde_json::Value = serde_json::from_str(&contents)?;
-            studio_json::validate_json(&contents).map_err(|e| anyhow::anyhow!(e))?;
-            eprintln!("JSON is syntactically valid. Schema validation not yet implemented.");
-        }
+        Commands::Validate { file } => match studio_json::parse_file(&file) {
+            Ok(project) => {
+                let chars: usize = project.scenes.iter().map(|s| s.characters.len()).sum();
+                println!("valid: {}", file.display());
+                println!("  project : {}", project.name);
+                println!(
+                    "  video   : {}x{} @ {} fps, {}s",
+                    project.video.width,
+                    project.video.height,
+                    project.video.fps,
+                    project.video.duration_seconds,
+                );
+                println!("  scenes  : {}", project.scenes.len());
+                println!("  chars   : {chars}");
+                println!(
+                    "  output  : {} -> {}",
+                    project.output.format, project.output.path
+                );
+            }
+            Err(e) => {
+                report_error(&file, &e);
+                process::exit(1);
+            }
+        },
         Commands::Render { file, out, .. } => {
             let out_display = out
                 .as_ref()
@@ -95,6 +112,33 @@ fn main() -> Result<()> {
             eprintln!("Not yet implemented.");
         }
     }
+}
 
-    Ok(())
+/// Print a structured, actionable error message to stderr.
+fn report_error(file: &Path, err: &ParseError) {
+    let path = file.display();
+    match err {
+        ParseError::Io(e) => {
+            eprintln!("error: cannot read {path}");
+            eprintln!("  {e}");
+        }
+        ParseError::InvalidJson(e) => {
+            eprintln!("error: invalid JSON in {path}");
+            // serde_json errors include line/column and the specific problem
+            // (missing field, wrong type, syntax error). Print each piece.
+            eprintln!("  line {}, column {}: {}", e.line(), e.column(), e);
+            if e.is_syntax() {
+                eprintln!(
+                    "  hint: check for trailing commas, unquoted keys, or mismatched brackets"
+                );
+            }
+        }
+        ParseError::UnsupportedVersion { expected, found } => {
+            eprintln!("error: unsupported schema version in {path}");
+            eprintln!("  found \"{found}\", expected \"{expected}\"");
+            eprintln!(
+                "  hint: this version of toonvara only supports schema_version \"{expected}\""
+            );
+        }
+    }
 }
