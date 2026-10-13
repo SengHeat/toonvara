@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "project": {
+    "name": "Cute Cartoon Demo",
+    "seed": 42
+  },
+  "video": {
+    "duration_seconds": 15,
+    "fps": 30,
+    "width": 1920,
+    "height": 1080
+  },
+  "assets": {
+    "characters": {
+      "hero": "assets/characters/hero.glb"
+    }
+  },
+  "scenes": [
+    {
+      "id": "scene_001",
+      "start_frame": 0,
+      "duration_frames": 450,
+      "environment": "forest_day",
+      "characters": [
+        {
+          "id": "hero_01",
+          "asset": "hero",
+          "position": [0, 0, 0],
+          "actions": [
+            {
+              "clip": "walk",
+              "start_frame": 0,
+              "duration_frames": 120
+            },
+            {
+              "clip": "wave",
+              "start_frame": 120,
+              "duration_frames": 60
+            },
+            {
+              "clip": "jump",
+              "start_frame": 180,
+              "duration_frames": 60
+            },
+            {
+              "clip": "idle",
+              "start_frame": 240,
+              "duration_frames": 210
+            }
+          ]
+        }
+      ],
+      "camera": {
+        "projection": "perspective",
+        "position": [0, 2, 6],
+        "target": [0, 1, 0]
+      }
+    }
+  ],
+  "output": {
+    "format": "mp4",
+    "path": "outputs/demo.mp4"
+  }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "toonvara-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Toonvara cartoon video generator"
+
+[[bin]]
+name = "toonvara"
+path = "src/main.rs"
+
+[dependencies]
+studio-core = { path = "../../crates/studio-core" }
+studio-json = { path = "../../crates/studio-json" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

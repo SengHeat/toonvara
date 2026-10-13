@@ -1,0 +1,17 @@
+[package]
+name = "toonvara-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop GUI for Toonvara cartoon video generator"
+
+[[bin]]
+name = "toonvara-desktop"
+path = "src/main.rs"
+
+[dependencies]
+studio-core = { path = "../../crates/studio-core" }
+eframe = { workspace = true }
+
+[lints]
+workspace = true

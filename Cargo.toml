@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "apps/cli",
+    "apps/desktop",
+    "crates/studio-core",
+    "crates/studio-json",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/user/toonvara"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.132"
+glam = { version = "0.29.2", features = ["serde"] }
+uuid = { version = "1.11.0", features = ["v4", "serde"] }
+thiserror = "2.0.9"
+anyhow = "1.0.94"
+clap = { version = "4.5.23", features = ["derive"] }
+eframe = "0.30.0"
