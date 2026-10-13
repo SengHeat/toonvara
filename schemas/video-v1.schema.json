@@ -150,6 +150,14 @@
           "default": [],
           "description": "Character instances placed in this scene."
         },
+        "audio": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/audio_clip"
+          },
+          "default": [],
+          "description": "Audio clips (music, voice, SFX) placed on this scene's timeline. Toonvara consumes pre-generated audio files — it does not generate audio."
+        },
         "camera": {
           "$ref": "#/$defs/camera"
         }
@@ -253,6 +261,37 @@
         }
       },
       "description": "A single animation action scheduled on a character."
+    },
+
+    "audio_clip": {
+      "type": "object",
+      "required": ["path", "start_frame", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Project-relative path to the audio file (.wav or .mp3)."
+        },
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Frame at which playback begins (relative to scene start)."
+        },
+        "volume": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1.0,
+          "description": "Playback volume from 0.0 (silent) to 1.0 (full)."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["music", "voice", "sfx"],
+          "description": "Semantic category of the audio clip."
+        }
+      },
+      "description": "A pre-generated audio clip (music, voice-over, or sound effect) to be mixed into the video."
     },
 
     "camera": {

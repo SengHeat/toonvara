@@ -100,6 +100,8 @@ pub struct Scene {
     #[serde(default)]
     pub characters: Vec<CharacterInstance>,
     #[serde(default)]
+    pub audio: Vec<AudioClip>,
+    #[serde(default)]
     pub camera: Option<Camera>,
 }
 
@@ -173,6 +175,51 @@ fn deserialize_action_speed<'de, D: serde::Deserializer<'de>>(
         ));
     }
     Ok(speed)
+}
+
+// ---------------------------------------------------------------------------
+// Audio
+// ---------------------------------------------------------------------------
+
+/// A pre-generated audio clip placed on the scene timeline.
+///
+/// Toonvara consumes externally-produced audio files (TTS, music, SFX) — it
+/// does not generate audio itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioClip {
+    /// Project-relative path to the audio file (.wav or .mp3).
+    pub path: String,
+    /// Frame at which playback begins (relative to scene start).
+    pub start_frame: u64,
+    /// Playback volume in the range 0.0 (silent) to 1.0 (full).
+    #[serde(default = "default_volume", deserialize_with = "deserialize_volume")]
+    pub volume: f64,
+    /// Semantic category of the audio clip.
+    #[serde(rename = "type")]
+    pub audio_type: AudioType,
+}
+
+fn default_volume() -> f64 {
+    1.0
+}
+
+fn deserialize_volume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        return Err(serde::de::Error::custom(
+            "volume must be a finite number between 0.0 and 1.0",
+        ));
+    }
+    Ok(v)
+}
+
+/// Semantic category for an audio clip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioType {
+    Music,
+    Voice,
+    Sfx,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,5 +338,71 @@ mod tests {
         let v = Vec3::new(1.0, 2.0, 3.0);
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(json, "[1.0,2.0,3.0]");
+    }
+
+    #[test]
+    fn audio_clip_defaults_and_roundtrip() {
+        let clip: AudioClip = serde_json::from_value(serde_json::json!({
+            "path": "audio/bgm.mp3",
+            "start_frame": 0,
+            "type": "music"
+        }))
+        .unwrap();
+        assert!((clip.volume - 1.0).abs() < f64::EPSILON);
+        assert_eq!(clip.audio_type, AudioType::Music);
+        let encoded = serde_json::to_value(&clip).unwrap();
+        let decoded: AudioClip = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.path, "audio/bgm.mp3");
+        assert_eq!(decoded.audio_type, AudioType::Music);
+    }
+
+    #[test]
+    fn audio_type_roundtrips() {
+        for (t, expected) in [
+            (AudioType::Music, "\"music\""),
+            (AudioType::Voice, "\"voice\""),
+            (AudioType::Sfx, "\"sfx\""),
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(json, expected);
+            let back: AudioType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, t);
+        }
+    }
+
+    #[test]
+    fn audio_volume_validation() {
+        for bad in ["-0.1", "1.1", "NaN", "Infinity", "null"] {
+            let json = format!(r#"{{"path":"a.wav","start_frame":0,"type":"sfx","volume":{bad}}}"#);
+            assert!(
+                serde_json::from_str::<AudioClip>(&json).is_err(),
+                "accepted volume={bad}"
+            );
+        }
+        // 0.0 and 1.0 are valid boundaries
+        for ok in ["0.0", "0.5", "1.0"] {
+            let json = format!(r#"{{"path":"a.wav","start_frame":0,"type":"sfx","volume":{ok}}}"#);
+            assert!(
+                serde_json::from_str::<AudioClip>(&json).is_ok(),
+                "rejected volume={ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_with_audio_deserializes() {
+        let scene: Scene = serde_json::from_value(serde_json::json!({
+            "id": "s", "start_frame": 0, "duration_frames": 300,
+            "audio": [
+                {"path": "bgm.mp3", "start_frame": 0, "type": "music", "volume": 0.8},
+                {"path": "hello.wav", "start_frame": 30, "type": "voice"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(scene.audio.len(), 2);
+        assert_eq!(scene.audio[0].audio_type, AudioType::Music);
+        assert!((scene.audio[0].volume - 0.8).abs() < f64::EPSILON);
+        assert_eq!(scene.audio[1].audio_type, AudioType::Voice);
+        assert!((scene.audio[1].volume - 1.0).abs() < f64::EPSILON);
     }
 }

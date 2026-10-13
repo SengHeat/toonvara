@@ -50,6 +50,19 @@
           ]
         }
       ],
+      "audio": [
+        {
+          "path": "assets/audio/forest_bgm.mp3",
+          "start_frame": 0,
+          "type": "music",
+          "volume": 0.6
+        },
+        {
+          "path": "assets/audio/narrator_hello.wav",
+          "start_frame": 30,
+          "type": "voice"
+        }
+      ],
       "camera": {
         "projection": "perspective",
         "position": [2.8, 1.6, 3.0],

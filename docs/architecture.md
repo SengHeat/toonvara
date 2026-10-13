@@ -45,14 +45,16 @@ JSON file  ──▶  studio-json (parse + validate)  ──▶  studio-core typ
 
 ## Known constraints
 
-### Khmer text shaping
+### Text overlays — Latin-only for MVP
 
-Toonvara's primary content language is Khmer. Khmer script requires complex
-text shaping (reordering, ligatures, above/below-base marks). Any subtitle,
-text overlay, or in-viewport text rendering must use a shaping engine that
-handles Khmer correctly — for example, HarfBuzz via `cosmic-text` or an
-equivalent Rust binding.
+Toonvara targets English / Latin-script global cartoons for the MVP. Subtitle
+and text overlay support is Latin-only for now.
 
-This is a first-class requirement, not an afterthought. When we add subtitle
-or text overlay support, the implementation must be validated against Khmer
-sample text before it is considered complete.
+### Khmer / complex-script text shaping (DEFERRED)
+
+Khmer script requires complex text shaping (reordering, ligatures,
+above/below-base marks) via HarfBuzz or an equivalent engine (e.g. `cosmic-text`).
+This is a real requirement for future localisation but is **deferred** — it is
+not an MVP constraint. When subtitle or text overlay support is extended beyond
+Latin script, the implementation must be validated against Khmer sample text
+before it is considered complete.
