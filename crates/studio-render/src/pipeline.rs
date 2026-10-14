@@ -211,10 +211,13 @@ fn render_video_inner(
         });
     }
 
-    // 7. Encode video with FFmpeg.
+    // 7. Collect audio tracks from all scenes.
+    let audio_tracks = collect_audio_tracks(params);
+    let has_audio = !audio_tracks.is_empty();
+
+    // 8. Encode video with FFmpeg.
     let input_pattern = format!("{}%04d.png", frame_prefix.display());
-    let video_only_path = if first_audio_clip(params).is_some() {
-        // We'll mux audio in a second pass; encode video to a temp file first.
+    let video_only_path = if has_audio {
         temp_dir.join("video_only.mp4")
     } else {
         params.out_path.clone()
@@ -227,35 +230,38 @@ fn render_video_inner(
     })?;
     let mut ffmpeg_log = encode_result.stderr;
 
-    // 8. Mux first audio clip (if present).
-    if let Some((audio, scene_start)) = first_audio_clip(params) {
-        let audio_path = Path::new(&audio.path);
-        if !audio_path.is_file() {
-            return Err(PipelineError::AudioMissing {
-                path: audio.path.clone(),
-            });
+    // 9. Mix all audio tracks and mux into the final MP4.
+    if has_audio {
+        for track in &audio_tracks {
+            if !track.path.is_file() {
+                return Err(PipelineError::AudioMissing {
+                    path: track.path.display().to_string(),
+                });
+            }
         }
-        #[allow(clippy::cast_precision_loss)]
-        let delay_secs = (scene_start + audio.start_frame) as f64 / f64::from(params.fps);
-        eprintln!(
-            "audio: muxing {} (type={:?}, delay={delay_secs:.2}s, vol={:.2})",
-            audio.path, audio.audio_type, audio.volume,
-        );
-        let mux_result = ffmpeg::mux_audio(&ffmpeg::MuxAudioParams {
-            video_path: video_only_path.clone(),
-            audio_path: audio_path.to_path_buf(),
+        for track in &audio_tracks {
+            eprintln!(
+                "audio: {} (delay={:.2}s, vol={:.2})",
+                track.path.display(),
+                track.delay_secs,
+                track.volume,
+            );
+        }
+        let mix_result = ffmpeg::mix_audio(&ffmpeg::MixAudioParams {
+            video_path: video_only_path,
+            tracks: audio_tracks,
             out_path: params.out_path.clone(),
-            delay_secs,
-            volume: audio.volume,
         })?;
+        // mix_audio returns the filter graph in stdout for logging.
+        eprintln!("audio filter_complex: {}", mix_result.stdout);
         ffmpeg_log.push('\n');
-        ffmpeg_log.push_str(&mux_result.stderr);
+        ffmpeg_log.push_str(&mix_result.stderr);
     }
 
-    // 9. Probe the output.
+    // 10. Probe the output.
     let probe = ffmpeg::probe(&params.out_path)?;
 
-    // 10. Basic sanity checks.
+    // 11. Basic sanity checks.
     if probe.width != params.width || probe.height != params.height {
         return Err(PipelineError::VerifyFailed {
             detail: format!(
@@ -275,9 +281,9 @@ fn render_video_inner(
         });
     }
 
-    if first_audio_clip(params).is_some() && !probe.has_audio {
+    if has_audio && !probe.has_audio {
         return Err(PipelineError::VerifyFailed {
-            detail: "audio track was muxed but output has no audio stream".to_string(),
+            detail: "audio was mixed but output has no audio stream".to_string(),
         });
     }
 
@@ -293,15 +299,28 @@ fn render_video_inner(
     })
 }
 
-/// Return the first audio clip from the resolved scenes, along with its
-/// scene's global start frame (so the audio delay can be computed).
-fn first_audio_clip(params: &VideoPipelineParams) -> Option<(&studio_core::AudioClip, u64)> {
-    params
-        .scenes
-        .as_ref()?
+/// Collect all audio clips from resolved scenes as `FFmpeg` `AudioTrack`s.
+///
+/// Each clip's `start_frame` is converted to a delay in seconds, offset by
+/// its scene's global `start_frame`.
+fn collect_audio_tracks(params: &VideoPipelineParams) -> Vec<ffmpeg::AudioTrack> {
+    let Some(scenes) = &params.scenes else {
+        return Vec::new();
+    };
+    scenes
         .iter()
-        .flat_map(|s| s.audio.iter().map(move |a| (a, s.start_frame)))
-        .next()
+        .flat_map(|s| {
+            s.audio.iter().map(move |clip| {
+                #[allow(clippy::cast_precision_loss)]
+                let delay_secs = (s.start_frame + clip.start_frame) as f64 / f64::from(params.fps);
+                ffmpeg::AudioTrack {
+                    path: PathBuf::from(&clip.path),
+                    delay_secs,
+                    volume: clip.volume,
+                }
+            })
+        })
+        .collect()
 }
 
 fn render_command(

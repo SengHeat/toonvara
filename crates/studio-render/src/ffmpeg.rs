@@ -96,18 +96,24 @@ pub struct ProbeInfo {
 // Public types — audio mux
 // ---------------------------------------------------------------------------
 
-/// Parameters for muxing an audio track into a video-only MP4.
-pub struct MuxAudioParams {
-    /// Path to the video-only MP4.
-    pub video_path: PathBuf,
+/// A single audio track to be mixed into the video.
+pub struct AudioTrack {
     /// Path to the audio file (.wav or .mp3).
-    pub audio_path: PathBuf,
-    /// Output MP4 path (with both streams).
-    pub out_path: PathBuf,
+    pub path: PathBuf,
     /// Delay before audio starts, in seconds.
     pub delay_secs: f64,
     /// Volume multiplier (0.0–1.0).
     pub volume: f64,
+}
+
+/// Parameters for mixing one or more audio tracks into a video-only MP4.
+pub struct MixAudioParams {
+    /// Path to the video-only MP4.
+    pub video_path: PathBuf,
+    /// Audio tracks to mix together.
+    pub tracks: Vec<AudioTrack>,
+    /// Output MP4 path (with both video and mixed audio).
+    pub out_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,20 +207,35 @@ pub fn encode(params: &EncodeParams) -> Result<EncodeResult, FfmpegError> {
 // Audio mux
 // ---------------------------------------------------------------------------
 
-/// Combine a video-only MP4 with a single audio file.
+/// Mix one or more audio tracks into a video-only MP4.
 ///
-/// Applies an optional delay (via the `adelay` filter) and volume adjustment
-/// (via the `volume` filter). The video stream is copied without re-encoding.
+/// Each track gets its own per-track `adelay` (delay) and `volume` filter,
+/// then all tracks are combined with `amix`.  The video stream is copied
+/// without re-encoding.
+///
+/// The `filter_complex` graph for N tracks looks like:
+///
+/// ```text
+/// [1:a]adelay=0|0,volume=0.6[a0];
+/// [2:a]adelay=1000|1000,volume=1[a1];
+/// [a0][a1]amix=inputs=2:normalize=0[aout]
+/// ```
+///
+/// `normalize=0` disables `amix`'s default per-input 1/N scaling so that
+/// each track's `volume` is the only gain control.  Returns the filter
+/// graph string in [`EncodeResult::stdout`] for logging.
 ///
 /// # Errors
 ///
-/// Returns [`FfmpegError::AudioMissing`] if the audio file does not exist,
+/// Returns [`FfmpegError::AudioMissing`] if any audio file does not exist,
 /// or [`FfmpegError::EncodeFailed`] if `FFmpeg` exits non-zero.
-pub fn mux_audio(params: &MuxAudioParams) -> Result<EncodeResult, FfmpegError> {
-    if !params.audio_path.is_file() {
-        return Err(FfmpegError::AudioMissing {
-            path: params.audio_path.display().to_string(),
-        });
+pub fn mix_audio(params: &MixAudioParams) -> Result<EncodeResult, FfmpegError> {
+    for track in &params.tracks {
+        if !track.path.is_file() {
+            return Err(FfmpegError::AudioMissing {
+                path: track.path.display().to_string(),
+            });
+        }
     }
 
     let ffmpeg = find_executable("ffmpeg")?;
@@ -223,42 +244,28 @@ pub fn mux_audio(params: &MuxAudioParams) -> Result<EncodeResult, FfmpegError> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Build the audio filter chain: delay then volume.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let delay_ms = (params.delay_secs * 1000.0).round() as u64;
-    let vol = params.volume;
-    let filter = if delay_ms > 0 && (vol - 1.0).abs() > f64::EPSILON {
-        format!("adelay={delay_ms}|{delay_ms},volume={vol}")
-    } else if delay_ms > 0 {
-        format!("adelay={delay_ms}|{delay_ms}")
-    } else if (vol - 1.0).abs() > f64::EPSILON {
-        format!("volume={vol}")
-    } else {
-        String::new()
-    };
+    let filter_graph = build_audio_filter_graph(&params.tracks);
 
     let mut cmd = Command::new(&ffmpeg);
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(params.video_path.as_os_str())
-        .arg("-i")
-        .arg(params.audio_path.as_os_str())
-        .arg("-c:v")
-        .arg("copy")
+    cmd.arg("-y").arg("-i").arg(params.video_path.as_os_str());
+
+    // Add each audio file as a separate input.
+    for track in &params.tracks {
+        cmd.arg("-i").arg(track.path.as_os_str());
+    }
+
+    cmd.arg("-filter_complex")
+        .arg(&filter_graph)
         .arg("-map")
         .arg("0:v:0")
         .arg("-map")
-        .arg("1:a:0");
-
-    if filter.is_empty() {
-        cmd.arg("-c:a").arg("aac");
-    } else {
-        cmd.arg("-af").arg(&filter);
-    }
-
-    // Ensure the output is no shorter than the video.
-    cmd.arg("-shortest");
-    cmd.arg(params.out_path.as_os_str());
+        .arg("[aout]")
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-shortest")
+        .arg(params.out_path.as_os_str());
 
     let output = cmd.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -282,9 +289,52 @@ pub fn mux_audio(params: &MuxAudioParams) -> Result<EncodeResult, FfmpegError> {
     Ok(EncodeResult {
         output_path: params.out_path.clone(),
         output_size: meta.len(),
-        stdout,
+        // Return the filter graph so the pipeline can log it.
+        stdout: filter_graph,
         stderr,
     })
+}
+
+/// Build the `filter_complex` string for N audio tracks.
+///
+/// Each track (input 1..N, since input 0 is the video) gets per-track
+/// `adelay` + `volume` filters, then all are combined with `amix`.
+///
+/// `amix` defaults to `normalize=1` which scales each input by 1/N — we
+/// disable this (`normalize=0`) so each track's explicit `volume` value is
+/// the sole gain control.
+fn build_audio_filter_graph(tracks: &[AudioTrack]) -> String {
+    use std::fmt::Write;
+
+    let mut parts = Vec::new();
+    let mut labels = Vec::new();
+
+    for (i, track) in tracks.iter().enumerate() {
+        let input_idx = i + 1; // input 0 is the video
+        let label = format!("a{i}");
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let delay_ms = (track.delay_secs * 1000.0).round() as u64;
+        let vol = track.volume;
+
+        let mut chain = format!("[{input_idx}:a]");
+        if delay_ms > 0 {
+            let _ = write!(chain, "adelay={delay_ms}|{delay_ms},");
+        }
+        let _ = write!(chain, "volume={vol}[{label}]");
+
+        parts.push(chain);
+        labels.push(format!("[{label}]"));
+    }
+
+    // amix combines all labelled streams into [aout].
+    let amix = format!(
+        "{}amix=inputs={}:normalize=0[aout]",
+        labels.join(""),
+        tracks.len()
+    );
+    parts.push(amix);
+    parts.join(";")
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +567,41 @@ mod tests {
         assert_eq!(
             extract_json_str(json, "r_frame_rate"),
             Some("30/1".to_string())
+        );
+    }
+
+    #[test]
+    fn audio_filter_graph_two_tracks() {
+        let tracks = vec![
+            AudioTrack {
+                path: PathBuf::from("bgm.mp3"),
+                delay_secs: 0.0,
+                volume: 0.6,
+            },
+            AudioTrack {
+                path: PathBuf::from("voice.wav"),
+                delay_secs: 1.0,
+                volume: 1.0,
+            },
+        ];
+        let graph = build_audio_filter_graph(&tracks);
+        assert_eq!(
+            graph,
+            "[1:a]volume=0.6[a0];[2:a]adelay=1000|1000,volume=1[a1];[a0][a1]amix=inputs=2:normalize=0[aout]"
+        );
+    }
+
+    #[test]
+    fn audio_filter_graph_single_track() {
+        let tracks = vec![AudioTrack {
+            path: PathBuf::from("sfx.wav"),
+            delay_secs: 2.5,
+            volume: 0.8,
+        }];
+        let graph = build_audio_filter_graph(&tracks);
+        assert_eq!(
+            graph,
+            "[1:a]adelay=2500|2500,volume=0.8[a0];[a0]amix=inputs=1:normalize=0[aout]"
         );
     }
 
