@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 studio-core = { path = "../../crates/studio-core" }
 studio-json = { path = "../../crates/studio-json" }
+studio-render = { path = "../../crates/studio-render" }
 eframe = { workspace = true }
 rfd = { workspace = true }
 

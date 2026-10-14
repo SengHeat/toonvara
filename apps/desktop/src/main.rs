@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use eframe::egui;
 use studio_core::Project;
+use studio_render::pipeline::{PipelineError, VideoPipelineParams, VideoPipelineResult};
 
 fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../public/favicon.png"))
@@ -22,6 +24,19 @@ fn main() -> eframe::Result {
 }
 
 // ---------------------------------------------------------------------------
+// Messages sent from the render thread to the UI
+// ---------------------------------------------------------------------------
+
+enum RenderMsg {
+    /// A status/log line from the render thread.
+    Status(String),
+    /// Render completed successfully.
+    Done(Box<VideoPipelineResult>),
+    /// Render failed.
+    Failed(String),
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -30,13 +45,28 @@ struct ToonvaraApp {
     about_open: bool,
     /// Currently loaded project (if any).
     loaded: Option<LoadedProject>,
-    /// Most recent parse error (displayed in the UI).
+    /// Most recent load/parse error.
     load_error: Option<String>,
+    /// Render-in-progress state.
+    render_state: RenderState,
 }
 
 struct LoadedProject {
     path: PathBuf,
     project: Project,
+}
+
+enum RenderState {
+    Idle,
+    Running {
+        rx: mpsc::Receiver<RenderMsg>,
+        status: String,
+        log_lines: Vec<String>,
+    },
+    Finished {
+        message: String,
+        is_error: bool,
+    },
 }
 
 impl ToonvaraApp {
@@ -55,6 +85,7 @@ impl ToonvaraApp {
             about_open: false,
             loaded: None,
             load_error: None,
+            render_state: RenderState::Idle,
         }
     }
 
@@ -70,10 +101,168 @@ impl ToonvaraApp {
             Ok(project) => {
                 self.loaded = Some(LoadedProject { path, project });
                 self.load_error = None;
+                self.render_state = RenderState::Idle;
             }
             Err(e) => {
                 self.load_error = Some(format!("{}: {e}", path.display()));
                 self.loaded = None;
+            }
+        }
+    }
+
+    fn is_rendering(&self) -> bool {
+        matches!(self.render_state, RenderState::Running { .. })
+    }
+
+    fn start_render(&mut self, ctx: &egui::Context) {
+        let Some(loaded) = &self.loaded else { return };
+
+        // Ask user for output path.
+        let default_out = PathBuf::from(&loaded.project.output.path);
+        let default_name = default_out
+            .file_name()
+            .map_or_else(|| "output.mp4".to_string(), |n| n.to_string_lossy().into_owned());
+
+        let out_path = rfd::FileDialog::new()
+            .add_filter("MP4 video", &["mp4"])
+            .set_file_name(&default_name)
+            .set_title("Save rendered video")
+            .save_file();
+
+        let Some(out_path) = out_path else { return };
+
+        // Prepare everything on the main thread so errors are immediate.
+        let project = &loaded.project;
+
+        let fps = project.video.fps;
+        let width = project.video.width;
+        let height = project.video.height;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frame_count = (project.video.duration_seconds * f64::from(fps)).round() as u32;
+
+        let (cam_pos, cam_tgt) = project
+            .scenes
+            .first()
+            .and_then(|s| s.camera.as_ref())
+            .map_or(([0.0, 2.0, 6.0], [0.0, 1.0, 0.0]), |c| {
+                (
+                    [c.position.x, c.position.y, c.position.z],
+                    [c.target.x, c.target.y, c.target.z],
+                )
+            });
+
+        let json_dir = loaded.path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+        let scenes = match studio_render::schedule::resolve(project, &json_dir, frame_count) {
+            Ok(s) => s,
+            Err(e) => {
+                self.render_state = RenderState::Finished {
+                    message: format!("Schedule error: {e}"),
+                    is_error: true,
+                };
+                return;
+            }
+        };
+
+        let script = find_adapter_script("render.py");
+
+        let (tx, rx) = mpsc::channel();
+        self.render_state = RenderState::Running {
+            rx,
+            status: "starting render...".to_string(),
+            log_lines: Vec::new(),
+        };
+
+        // Clone the egui context so the background thread can request repaints.
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let send = |msg: RenderMsg| {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            };
+
+            send(RenderMsg::Status(format!(
+                "rendering {frame_count} frames ({width}x{height} @ {fps} fps)..."
+            )));
+
+            let params = VideoPipelineParams {
+                blender_script: script,
+                out_path: out_path.clone(),
+                width,
+                height,
+                fps,
+                frame_count,
+                camera_pos: cam_pos,
+                camera_target: cam_tgt,
+                character_glb: None,
+                character_pos: [0.0; 3],
+                animation_clip: None,
+                scenes: Some(scenes),
+            };
+
+            match studio_render::pipeline::render_video(&params) {
+                Ok(result) => {
+                    // Send interesting log lines as status updates.
+                    for line in result.blender_log.lines() {
+                        if line.starts_with("TOONVARA_SCHEDULE:")
+                            || line.starts_with("TOONVARA_IMPORT:")
+                            || line.starts_with("TOONVARA_RIG:")
+                        {
+                            send(RenderMsg::Status(line.to_string()));
+                        }
+                    }
+                    send(RenderMsg::Done(Box::new(result)));
+                }
+                Err(e) => {
+                    send(RenderMsg::Failed(format_pipeline_error(&e)));
+                }
+            }
+        });
+    }
+
+    /// Drain messages from the render thread.
+    fn poll_render(&mut self) {
+        let RenderState::Running {
+            rx,
+            status,
+            log_lines,
+        } = &mut self.render_state
+        else {
+            return;
+        };
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                RenderMsg::Status(line) => {
+                    status.clone_from(&line);
+                    log_lines.push(line);
+                }
+                RenderMsg::Done(result) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let size_kb = result.output_size as f64 / 1024.0;
+                    let msg = format!(
+                        "Render complete: {} ({:.1} KB, {}x{}, {:.1} fps, {:.1}s)",
+                        result.output_path.display(),
+                        size_kb,
+                        result.probe.width,
+                        result.probe.height,
+                        result.probe.fps,
+                        result.probe.duration_secs,
+                    );
+                    self.render_state = RenderState::Finished {
+                        message: msg,
+                        is_error: false,
+                    };
+                    return;
+                }
+                RenderMsg::Failed(err) => {
+                    self.render_state = RenderState::Finished {
+                        message: err,
+                        is_error: true,
+                    };
+                    return;
+                }
             }
         }
     }
@@ -85,14 +274,27 @@ impl ToonvaraApp {
 
 impl eframe::App for ToonvaraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain any pending render messages each frame.
+        self.poll_render();
+
         // --- Top bar -------------------------------------------------------
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add(egui::Image::new(&self.logo).max_size(egui::vec2(28.0, 28.0)));
                 ui.heading("Toonvara");
                 ui.separator();
-                if ui.button("Open").clicked() {
+                if ui
+                    .add_enabled(!self.is_rendering(), egui::Button::new("Open"))
+                    .clicked()
+                {
                     self.open_project();
+                }
+                let can_render = self.loaded.is_some() && !self.is_rendering();
+                if ui
+                    .add_enabled(can_render, egui::Button::new("Render"))
+                    .clicked()
+                {
+                    self.start_render(ctx);
                 }
                 if ui.button("About").clicked() {
                     self.about_open = true;
@@ -103,22 +305,20 @@ impl eframe::App for ToonvaraApp {
             });
         });
 
+        // --- Render status panel (bottom) ----------------------------------
+        show_render_panel(ctx, &self.render_state);
+
         // --- Central panel -------------------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Parse error banner.
             if let Some(err) = &self.load_error {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(80, 20, 20))
-                    .inner_margin(8.0)
-                    .rounding(4.0)
-                    .show(ui, |ui| {
-                        ui.colored_label(egui::Color32::from_rgb(255, 180, 180), err);
-                    });
+                error_banner(ui, err);
                 ui.add_space(8.0);
             }
 
             if let Some(loaded) = &self.loaded {
-                show_project_summary(ui, loaded);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    show_project_summary(ui, loaded);
+                });
             } else {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
@@ -143,6 +343,63 @@ impl eframe::App for ToonvaraApp {
                 });
             });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Render status bottom panel
+// ---------------------------------------------------------------------------
+
+fn show_render_panel(ctx: &egui::Context, state: &RenderState) {
+    match state {
+        RenderState::Idle => {}
+        RenderState::Running {
+            status, log_lines, ..
+        } => {
+            egui::TopBottomPanel::bottom("render_panel").show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.strong(status);
+                });
+                if log_lines.len() > 1 {
+                    let last = &log_lines[log_lines.len() - 2];
+                    ui.weak(last);
+                }
+                ui.add_space(4.0);
+            });
+        }
+        RenderState::Finished { message, is_error } => {
+            egui::TopBottomPanel::bottom("render_panel").show(ctx, |ui| {
+                ui.add_space(4.0);
+                if *is_error {
+                    error_banner(ui, message);
+                } else {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(20, 60, 20))
+                        .inner_margin(8.0)
+                        .rounding(4.0)
+                        .show(ui, |ui| {
+                            ui.colored_label(egui::Color32::from_rgb(180, 255, 180), message);
+                        });
+                }
+                ui.add_space(4.0);
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared UI helpers
+// ---------------------------------------------------------------------------
+
+fn error_banner(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(80, 20, 20))
+        .inner_margin(8.0)
+        .rounding(4.0)
+        .show(ui, |ui| {
+            ui.colored_label(egui::Color32::from_rgb(255, 180, 180), text);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +436,6 @@ fn show_project_summary(ui: &mut egui::Ui, loaded: &LoadedProject) {
             );
         });
 
-    // --- Character assets --------------------------------------------------
     if !p.assets.characters.is_empty() {
         ui.add_space(16.0);
         ui.heading("Character Assets");
@@ -192,7 +448,6 @@ fn show_project_summary(ui: &mut egui::Ui, loaded: &LoadedProject) {
         }
     }
 
-    // --- Scenes ------------------------------------------------------------
     ui.add_space(16.0);
     ui.heading("Scenes");
     ui.add_space(4.0);
@@ -259,4 +514,43 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.strong(label);
     ui.label(value);
     ui.end_row();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Locate an adapter script relative to CWD or the running binary.
+fn find_adapter_script(filename: &str) -> PathBuf {
+    let rel = format!("adapters/blender/{filename}");
+    let candidates: Vec<PathBuf> = vec![
+        PathBuf::from(&rel),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(format!("../../{rel}"))))
+            .unwrap_or_default(),
+    ];
+    for c in &candidates {
+        if c.is_file() {
+            return c.clone();
+        }
+    }
+    candidates.into_iter().next().unwrap_or_default()
+}
+
+fn format_pipeline_error(err: &PipelineError) -> String {
+    match err {
+        PipelineError::Blender(inner) => format!("Blender failed: {inner}"),
+        PipelineError::Ffmpeg(inner) => format!("FFmpeg failed: {inner}"),
+        PipelineError::Io(e) => format!("I/O error: {e}"),
+        PipelineError::FrameCountMismatch { expected, found } => {
+            format!("Frame count mismatch: expected {expected}, got {found}")
+        }
+        PipelineError::VerifyFailed { detail } => format!("Verification failed: {detail}"),
+        PipelineError::CharacterMissing { path } => {
+            format!("Character GLB not found: {path}")
+        }
+        PipelineError::ClipValidation(detail) => format!("Clip not in GLB: {detail}"),
+        PipelineError::AudioMissing { path } => format!("Audio file not found: {path}"),
+    }
 }

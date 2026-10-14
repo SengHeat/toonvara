@@ -3230,6 +3230,7 @@ dependencies = [
  "rfd",
  "studio-core",
  "studio-json",
+ "studio-render",
 ]
 
 [[package]]
